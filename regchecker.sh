@@ -4,9 +4,10 @@
 # Репозиторий: https://github.com/ShellGross/ipregchck
 #
 # Этап 1: страна по IP из нескольких независимых GeoIP-источников.
+# Этап 2: ChatGPT / OpenAI (регион из trace, живая проба API, список стран OpenAI).
 # Зависимости: bash, curl, jq.
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 LANG_UI="ru"
 IP_MODE=""
@@ -20,6 +21,11 @@ SHOW_HELP=0
 SHOW_VERSION=0
 MY_IP=""
 TMPD=""
+GEO_TOP=""
+CURL_ARGS=()
+PROBE_CODE=""
+PROBE_BODY=""
+MIN_LIST=100
 
 UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
@@ -63,6 +69,54 @@ t() {
     en:err_value) printf '%s' 'Option %s: value is missing or invalid' ;;
     ru:see_help) printf '%s' 'Справка: regchecker.sh --help' ;;
     en:see_help) printf '%s' 'Help: regchecker.sh --help' ;;
+    ru:svc_chatgpt) printf '%s' 'ChatGPT / OpenAI' ;;
+    en:svc_chatgpt) printf '%s' 'ChatGPT / OpenAI' ;;
+    ru:l_region) printf '%s' 'Регион' ;;
+    en:l_region) printf '%s' 'Region' ;;
+    ru:l_live) printf '%s' 'Проба API' ;;
+    en:l_live) printf '%s' 'API probe' ;;
+    ru:l_list_openai) printf '%s' 'Список OpenAI' ;;
+    en:l_list_openai) printf '%s' 'OpenAI list' ;;
+    ru:l_verdict) printf '%s' 'Вердикт' ;;
+    en:l_verdict) printf '%s' 'Verdict' ;;
+    ru:src_trace) printf '%s' 'по trace сервиса' ;;
+    en:src_trace) printf '%s' 'service trace' ;;
+    ru:src_geoip) printf '%s' 'по GeoIP, trace недоступен' ;;
+    en:src_geoip) printf '%s' 'GeoIP, trace unavailable' ;;
+    ru:region_none) printf '%s' 'нет данных' ;;
+    en:region_none) printf '%s' 'no data' ;;
+    ru:live_ok) printf '%s' 'ответ получен, блока нет (HTTP %s)' ;;
+    en:live_ok) printf '%s' 'responded, no block (HTTP %s)' ;;
+    ru:live_blocked) printf '%s' 'региональный блок (HTTP %s)' ;;
+    en:live_blocked) printf '%s' 'region block (HTTP %s)' ;;
+    ru:live_unknown) printf '%s' 'нет внятного ответа (HTTP %s)' ;;
+    en:live_unknown) printf '%s' 'no clear answer (HTTP %s)' ;;
+    ru:list_supported) printf '%s' 'в списке' ;;
+    en:list_supported) printf '%s' 'listed' ;;
+    ru:list_unsupported) printf '%s' 'нет в списке' ;;
+    en:list_unsupported) printf '%s' 'not listed' ;;
+    ru:list_partial) printf '%s' 'с оговорками' ;;
+    en:list_partial) printf '%s' 'with exceptions' ;;
+    ru:list_unknown) printf '%s' 'нет данных' ;;
+    en:list_unknown) printf '%s' 'no data' ;;
+    ru:list_web) printf '%s' 'сайт' ;;
+    en:list_web) printf '%s' 'live page' ;;
+    ru:list_snapshot) printf '%s' 'снимок %s' ;;
+    en:list_snapshot) printf '%s' 'snapshot %s' ;;
+    ru:v_ok) printf '%s' 'доступен' ;;
+    en:v_ok) printf '%s' 'available' ;;
+    ru:v_blocked) printf '%s' 'не доступен' ;;
+    en:v_blocked) printf '%s' 'not available' ;;
+    ru:v_partial) printf '%s' 'частично' ;;
+    en:v_partial) printf '%s' 'partially' ;;
+    ru:v_conflict) printf '%s' 'расхождение' ;;
+    en:v_conflict) printf '%s' 'conflict' ;;
+    ru:v_unknown) printf '%s' 'нет данных' ;;
+    en:v_unknown) printf '%s' 'no data' ;;
+    ru:note_conflict) printf '%s' 'API отвечает, а страны нет в списке' ;;
+    en:note_conflict) printf '%s' 'API responds, but the country is not listed' ;;
+    ru:note_partial) printf '%s' 'доступ зависит от области, по IP не проверить' ;;
+    en:note_partial) printf '%s' 'depends on the area, cannot tell from the IP' ;;
     *) printf '%s' "$1" ;;
   esac
 }
@@ -229,17 +283,36 @@ check_deps() {
 # Сеть
 # ---------------------------------------------------------------------------
 
+build_curl_args() {
+  CURL_ARGS=(-s -L --connect-timeout 5 --max-time "$TIMEOUT" -A "$UA")
+  [[ -n $IP_MODE ]] && CURL_ARGS+=("$IP_MODE")
+  [[ -n $PROXY ]] && CURL_ARGS+=(--proxy "socks5h://$PROXY")
+  [[ -n $IFACE ]] && CURL_ARGS+=(--interface "$IFACE")
+}
+
+# GET с отказом на HTTP-ошибках (-f): печатает тело ответа
 http_get() {
   local url="$1"
-  local args=(-s -f -L --connect-timeout 5 --max-time "$TIMEOUT" -A "$UA")
-  [[ -n $IP_MODE ]] && args+=("$IP_MODE")
-  [[ -n $PROXY ]] && args+=(--proxy "socks5h://$PROXY")
-  [[ -n $IFACE ]] && args+=(--interface "$IFACE")
   if ((DEBUG)); then
     printf '[debug] GET %s\n' "$url" >&2
-    curl "${args[@]}" "$url"
+    curl "${CURL_ARGS[@]}" -f "$url"
   else
-    curl "${args[@]}" "$url" 2>/dev/null
+    curl "${CURL_ARGS[@]}" -f "$url" 2>/dev/null
+  fi
+}
+
+# GET без -f: заполняет PROBE_CODE (000, если ответа нет) и PROBE_BODY
+http_probe() {
+  local url="$1" out
+  PROBE_CODE="000"
+  PROBE_BODY=""
+  if ((DEBUG)); then
+    printf '[debug] PROBE %s\n' "$url" >&2
+  fi
+  out=$(curl "${CURL_ARGS[@]}" -w $'\n%{http_code}' "$url" 2>/dev/null)
+  if [[ ${out##*$'\n'} =~ ^[0-9]{3}$ ]]; then
+    PROBE_CODE="${out##*$'\n'}"
+    PROBE_BODY="${out%$'\n'*}"
   fi
 }
 
@@ -288,6 +361,636 @@ geo_ipaddress() {
   http_get "https://api.ipaddress.com/iptocountry?format=json" | jq -r '.country_code // empty' 2>/dev/null
 }
 
+
+# ---------------------------------------------------------------------------
+# Официальные списки стран
+# ---------------------------------------------------------------------------
+
+# Таблица «название страны -> ISO»: ключ = только латинские буквы, нижний регистр.
+# Диакритика просто вырезается, поэтому «Côte d’Ivoire» и «Cote d'Ivoire» есть оба.
+COUNTRY_KEYS='afghanistan AF
+alandislands AX
+albania AL
+algeria DZ
+americansamoa AS
+andorra AD
+angola AO
+anguilla AI
+antarctica AQ
+antiguaandbarbuda AG
+arabrepublicofegypt EG
+argentina AR
+argentinerepublic AR
+armenia AM
+aruba AW
+australia AU
+austria AT
+azerbaijan AZ
+bahamas BS
+bahrain BH
+bangladesh BD
+barbados BB
+belarus BY
+belgium BE
+belize BZ
+benin BJ
+bermuda BM
+bhutan BT
+bolivarianrepublicofvenezuela VE
+bolivia BO
+boliviaplurinationalstateof BO
+bonairesinteustatiusandsaba BQ
+bosniaandherzegovina BA
+botswana BW
+bouvetisland BV
+brazil BR
+britishindianoceanterritory IO
+britishvirginislands VG
+brunei BN
+bruneidarussalam BN
+bulgaria BG
+burkinafaso BF
+burma MM
+burundi BI
+caboverde CV
+cambodia KH
+cameroon CM
+canada CA
+capeverde CV
+caribbeannetherlands BQ
+caymanislands KY
+centralafricanrepublic CF
+chad TD
+chile CL
+china CN
+christmasisland CX
+cocosislands CC
+cocoskeelingislands CC
+colombia CO
+commonwealthofdominica DM
+commonwealthofthebahamas BS
+commonwealthofthenorthernmarianaislands MP
+comoros KM
+congo CG
+congobrazzaville CG
+congodrc CD
+congokinshasa CD
+congothedemocraticrepublicofthe CD
+cookislands CK
+costarica CR
+cotedivoire CI
+croatia HR
+ctedivoire CI
+cuba CU
+curaao CW
+curacao CW
+cyprus CY
+czechia CZ
+czechrepublic CZ
+democraticpeoplesrepublicofkorea KP
+democraticrepublicofsaotomeandprincipe ST
+democraticrepublicofthecongo CD
+democraticrepublicoftimorleste TL
+democraticsocialistrepublicofsrilanka LK
+denmark DK
+djibouti DJ
+dominica DM
+dominicanrepublic DO
+drcongo CD
+easternrepublicofuruguay UY
+easttimor TL
+ecuador EC
+egypt EG
+elsalvador SV
+equatorialguinea GQ
+eritrea ER
+estonia EE
+eswatini SZ
+eswatiniswaziland SZ
+ethiopia ET
+falklandislands FK
+falklandislandsmalvinas FK
+faroeislands FO
+federaldemocraticrepublicofethiopia ET
+federaldemocraticrepublicofnepal NP
+federalrepublicofgermany DE
+federalrepublicofnigeria NG
+federalrepublicofsomalia SO
+federatedstatesofmicronesia FM
+federativerepublicofbrazil BR
+fiji FJ
+finland FI
+france FR
+frenchguiana GF
+frenchpolynesia PF
+frenchrepublic FR
+frenchsouthernterritories TF
+gabon GA
+gaboneserepublic GA
+gambia GM
+georgia GE
+germany DE
+ghana GH
+gibraltar GI
+grandduchyofluxembourg LU
+greatbritain GB
+greece GR
+greenland GL
+grenada GD
+guadeloupe GP
+guam GU
+guatemala GT
+guernsey GG
+guinea GN
+guineabissau GW
+guyana GY
+haiti HT
+hashemitekingdomofjordan JO
+heardislandandmcdonaldislands HM
+hellenicrepublic GR
+holysee VA
+holyseevaticancitystate VA
+honduras HN
+hongkong HK
+hongkongsar HK
+hongkongspecialadministrativeregionofchina HK
+hungary HU
+iceland IS
+independentstateofpapuanewguinea PG
+independentstateofsamoa WS
+india IN
+indonesia ID
+iran IR
+iranislamicrepublicof IR
+iraq IQ
+ireland IE
+islamicrepublicofafghanistan AF
+islamicrepublicofiran IR
+islamicrepublicofmauritania MR
+islamicrepublicofpakistan PK
+isleofman IM
+israel IL
+italianrepublic IT
+italy IT
+ivorycoast CI
+jamaica JM
+japan JP
+jersey JE
+jordan JO
+kazakhstan KZ
+kenya KE
+kingdomofbahrain BH
+kingdomofbelgium BE
+kingdomofbhutan BT
+kingdomofcambodia KH
+kingdomofdenmark DK
+kingdomofeswatini SZ
+kingdomoflesotho LS
+kingdomofmorocco MA
+kingdomofnorway NO
+kingdomofsaudiarabia SA
+kingdomofspain ES
+kingdomofsweden SE
+kingdomofthailand TH
+kingdomofthenetherlands NL
+kingdomoftonga TO
+kiribati KI
+koreademocraticpeoplesrepublicof KP
+korearepublicof KR
+kosovo XK
+kuwait KW
+kyrgyzrepublic KG
+kyrgyzstan KG
+landislands AX
+laopeoplesdemocraticrepublic LA
+laos LA
+latvia LV
+lebaneserepublic LB
+lebanon LB
+lesotho LS
+liberia LR
+libya LY
+liechtenstein LI
+lithuania LT
+luxembourg LU
+macao MO
+macaosar MO
+macaospecialadministrativeregionofchina MO
+macau MO
+macedonia MK
+madagascar MG
+malawi MW
+malaysia MY
+maldives MV
+mali ML
+malta MT
+marshallislands MH
+martinique MQ
+mauritania MR
+mauritius MU
+mayotte YT
+mexico MX
+micronesia FM
+micronesiafederatedstatesof FM
+moldova MD
+moldovarepublicof MD
+monaco MC
+mongolia MN
+montenegro ME
+montserrat MS
+morocco MA
+mozambique MZ
+myanmar MM
+namibia NA
+nauru NR
+nepal NP
+netherlands NL
+newcaledonia NC
+newzealand NZ
+nicaragua NI
+niger NE
+nigeria NG
+niue NU
+norfolkisland NF
+northernmarianaislands MP
+northkorea KP
+northmacedonia MK
+norway NO
+oman OM
+pakistan PK
+palau PW
+palestine PS
+palestinestateof PS
+panama PA
+papuanewguinea PG
+paraguay PY
+peoplesdemocraticrepublicofalgeria DZ
+peoplesrepublicofbangladesh BD
+peoplesrepublicofchina CN
+peru PE
+philippines PH
+pitcairn PN
+pitcairnislands PN
+plurinationalstateofbolivia BO
+poland PL
+portugal PT
+portugueserepublic PT
+principalityofandorra AD
+principalityofliechtenstein LI
+principalityofmonaco MC
+puertorico PR
+qatar QA
+republicofalbania AL
+republicofangola AO
+republicofarmenia AM
+republicofaustria AT
+republicofazerbaijan AZ
+republicofbelarus BY
+republicofbenin BJ
+republicofbosniaandherzegovina BA
+republicofbotswana BW
+republicofbulgaria BG
+republicofburundi BI
+republicofcaboverde CV
+republicofcameroon CM
+republicofchad TD
+republicofchile CL
+republicofcolombia CO
+republicofcostarica CR
+republicofcotedivoire CI
+republicofcroatia HR
+republicofctedivoire CI
+republicofcuba CU
+republicofcyprus CY
+republicofdjibouti DJ
+republicofecuador EC
+republicofelsalvador SV
+republicofequatorialguinea GQ
+republicofestonia EE
+republicoffiji FJ
+republicoffinland FI
+republicofghana GH
+republicofguatemala GT
+republicofguinea GN
+republicofguineabissau GW
+republicofguyana GY
+republicofhaiti HT
+republicofhonduras HN
+republicoficeland IS
+republicofindia IN
+republicofindonesia ID
+republicofiraq IQ
+republicofkazakhstan KZ
+republicofkenya KE
+republicofkiribati KI
+republicofkorea KR
+republicoflatvia LV
+republicofliberia LR
+republicoflithuania LT
+republicofmadagascar MG
+republicofmalawi MW
+republicofmaldives MV
+republicofmali ML
+republicofmalta MT
+republicofmauritius MU
+republicofmoldova MD
+republicofmozambique MZ
+republicofmyanmar MM
+republicofnamibia NA
+republicofnauru NR
+republicofnicaragua NI
+republicofnorthmacedonia MK
+republicofpalau PW
+republicofpanama PA
+republicofparaguay PY
+republicofperu PE
+republicofpoland PL
+republicofsanmarino SM
+republicofsenegal SN
+republicofserbia RS
+republicofseychelles SC
+republicofsierraleone SL
+republicofsingapore SG
+republicofslovenia SI
+republicofsouthafrica ZA
+republicofsouthsudan SS
+republicofsuriname SR
+republicoftajikistan TJ
+republicofthecongo CG
+republicofthegambia GM
+republicofthemarshallislands MH
+republicoftheniger NE
+republicofthephilippines PH
+republicofthesudan SD
+republicoftrinidadandtobago TT
+republicoftrkiye TR
+republicoftunisia TN
+republicofturkiye TR
+republicofuganda UG
+republicofuzbekistan UZ
+republicofvanuatu VU
+republicofyemen YE
+republicofzambia ZM
+republicofzimbabwe ZW
+reunion RE
+romania RO
+runion RE
+russia RU
+russianfederation RU
+rwanda RW
+rwandeserepublic RW
+saintbarthelemy BL
+saintbarthlemy BL
+sainthelena SH
+sainthelenaascensionandtristandacunha SH
+saintkittsandnevis KN
+saintlucia LC
+saintmartin MF
+saintmartinfrenchpart MF
+saintpierreandmiquelon PM
+saintvincentandthegrenadines VC
+samoa WS
+sanmarino SM
+saotomeandprincipe ST
+saudiarabia SA
+senegal SN
+serbia RS
+seychelles SC
+sierraleone SL
+singapore SG
+sintmaarten SX
+sintmaartendutchpart SX
+slovakia SK
+slovakrepublic SK
+slovenia SI
+socialistrepublicofvietnam VN
+solomonislands SB
+somalia SO
+sotomandprncipe ST
+southafrica ZA
+southgeorgiaandthesouthsandwichislands GS
+southkorea KR
+southsudan SS
+spain ES
+srilanka LK
+stateofisrael IL
+stateofkuwait KW
+stateofqatar QA
+sudan SD
+sultanateofoman OM
+suriname SR
+svalbardandjanmayen SJ
+swaziland SZ
+sweden SE
+swissconfederation CH
+switzerland CH
+syria SY
+syrianarabrepublic SY
+taiwan TW
+taiwanprovinceofchina TW
+tajikistan TJ
+tanzania TZ
+tanzaniaunitedrepublicof TZ
+thailand TH
+thebahamas BS
+thegambia GM
+thestateoferitrea ER
+thestateofpalestine PS
+timorleste TL
+togo TG
+togoleserepublic TG
+tokelau TK
+tonga TO
+trinidadandtobago TT
+trkiye TR
+tunisia TN
+turkey TR
+turkiye TR
+turkmenistan TM
+turksandcaicosislands TC
+tuvalu TV
+uae AE
+uganda UG
+uk GB
+ukraine UA
+unionofthecomoros KM
+unitedarabemirates AE
+unitedkingdom GB
+unitedkingdomofgreatbritainandnorthernireland GB
+unitedmexicanstates MX
+unitedrepublicoftanzania TZ
+unitedstates US
+unitedstatesminoroutlyingislands UM
+unitedstatesofamerica US
+uruguay UY
+usa US
+usminoroutlyingislands UM
+usvirginislands VI
+uzbekistan UZ
+vanuatu VU
+vatican VA
+vaticancity VA
+venezuela VE
+venezuelabolivarianrepublicof VE
+vietnam VN
+virginislandsbritish VG
+virginislandsoftheunitedstates VI
+virginislandsus VI
+wallisandfutuna WF
+westernsahara EH
+yemen YE
+zambia ZM
+zimbabwe ZW'
+
+# Разбор текста/markdown/HTML: каждая строка, целиком равная названию страны,
+# превращается в «CC» или «CC partial» (если в названии есть оговорка except).
+# shellcheck disable=SC2016  # в awk-программе $0 и $1 должны остаться как есть
+PARSE_AWK='
+function key(s,   t) { t = s; gsub(/[^abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]/, "", t); return tolower(t) }
+FNR == NR { T[$1] = $2; next }
+{
+  s = $0
+  gsub(/\r/, "", s)
+  sub(/^[ \t]*[-*+][ \t]+/, "", s)
+  if (s == "" || length(s) > 80) next
+  k = key(s); code = ""; partial = 0
+  if (k in T) { code = T[k] }
+  else {
+    b = s; gsub(/\([^)]*\)/, "", b); kb = key(b)
+    if (kb in T) { code = T[kb] }
+    if (s ~ /[Ee]xcept/) { partial = 1 }
+  }
+  if (code != "") { print code (partial ? " partial" : "") }
+}'
+
+parse_country_list() {
+  printf '%s\n' "$COUNTRY_KEYS" >"$TMPD/table"
+  # shellcheck disable=SC2020  # '<' и '>' оба заменяются на перевод строки: теги HTML становятся отдельными строками
+  tr '<>' '\n\n' | awk "$PARSE_AWK" "$TMPD/table" -
+}
+
+# Вшитый снимок списка OpenAI (запасной вариант, если страница недоступна)
+SNAP_OPENAI_DATE="2026-11-21"
+SNAP_OPENAI_CODES="AD AE AF AG AL AM AO AR AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BR BS BT BW BZ CA CD CF CG CH CI CL CM CO CR CV CY CZ DE DJ DK DM DO DZ EC EE EG ER ES ET FI FJ FM FO FR GA GB GD GE GF GH GL GM GN GP GQ GR GT GW GY HN HR HT HU ID IE IL IN IQ IS IT JM JO JP KE KG KH KI KM KN KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MQ MR MT MU MV MW MX MY MZ NA NC NE NG NI NL NO NP NR NZ OM PA PE PF PG PH PK PL PM PS PT PW PY QA RE RO RS RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SZ TD TF TG TH TJ TL TM TN TO TR TT TV TW TZ UG US UY UZ VA VC VN VU WF WS YE YT ZA ZM ZW"
+SNAP_OPENAI_PARTIAL="UA"
+
+LIST_CODES=""
+LIST_PARTIAL=""
+LIST_SRC=""
+LIST_DATE=""
+
+# load_country_list СНИМОК_КОДЫ СНИМОК_ОГОВОРКИ СНИМОК_ДАТА URL...
+# Пробует страницы по очереди; если ни одна не дала разумный список, берёт снимок.
+load_country_list() {
+  local snap_codes="$1" snap_partial="$2" snap_date="$3" url body parsed n
+  shift 3
+  LIST_CODES=""
+  LIST_PARTIAL=""
+  LIST_SRC=""
+  LIST_DATE=""
+  for url in "$@"; do
+    body=$(http_get "$url") || continue
+    [[ -n $body ]] || continue
+    parsed=$(printf '%s\n' "$body" | parse_country_list)
+    n=$(printf '%s\n' "$parsed" | grep -c .)
+    if ((n >= MIN_LIST)); then
+      LIST_CODES=" $(printf '%s\n' "$parsed" | awk '$2 != "partial" {print $1}' | sort -u | tr '\n' ' ')"
+      LIST_PARTIAL=" $(printf '%s\n' "$parsed" | awk '$2 == "partial" {print $1}' | sort -u | tr '\n' ' ')"
+      LIST_SRC="web"
+      return 0
+    fi
+  done
+  LIST_CODES=" $snap_codes "
+  LIST_PARTIAL=" $snap_partial "
+  LIST_SRC="snapshot"
+  LIST_DATE="$snap_date"
+}
+
+# Печатает: supported | partial | unsupported | unknown
+list_state() {
+  local cc="$1"
+  if [[ -z $cc ]]; then
+    printf 'unknown'
+  elif [[ $LIST_PARTIAL == *" $cc "* ]]; then
+    printf 'partial'
+  elif [[ $LIST_CODES == *" $cc "* ]]; then
+    printf 'supported'
+  else
+    printf 'unsupported'
+  fi
+}
+
+# make_verdict LIVE LIST -> ok | blocked | partial | conflict | unknown
+# Ответ API без ключа сам по себе доступность не доказывает: «ok» только вместе со списком.
+make_verdict() {
+  local live="$1" list="$2"
+  if [[ $live == blocked ]]; then
+    printf 'blocked'
+  elif [[ $list == partial ]]; then
+    printf 'partial'
+  elif [[ $live == ok && $list == supported ]]; then
+    printf 'ok'
+  elif [[ $live == ok && $list == unsupported ]]; then
+    printf 'conflict'
+  elif [[ $live == unknown && $list == supported ]]; then
+    printf 'ok'
+  elif [[ $live == unknown && $list == unsupported ]]; then
+    printf 'blocked'
+  else
+    printf 'unknown'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# ChatGPT / OpenAI
+# ---------------------------------------------------------------------------
+
+CG_REGION=""
+CG_REGION_SRC=""
+CG_LIVE=""
+CG_LIVE_CODE=""
+CG_LIST=""
+CG_VERDICT=""
+
+# Живая проба api.openai.com без ключа: при блоке по региону OpenAI отвечает
+# 403 с кодом unsupported_country_region_territory.
+classify_openai_probe() {
+  case "$PROBE_CODE" in
+    403)
+      if [[ $PROBE_BODY == *unsupported_country_region_territory* ]]; then
+        printf 'blocked'
+      else
+        printf 'unknown'
+      fi
+      ;;
+    401 | 429 | 2??) printf 'ok' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+check_chatgpt() {
+  local trace loc
+  trace=$(http_get "https://chatgpt.com/cdn-cgi/trace" | sed -n 's/^loc=//p' | head -n1)
+  loc=$(norm_cc "$trace")
+  if [[ -n $loc ]]; then
+    CG_REGION="$loc"
+    CG_REGION_SRC="trace"
+  elif [[ -n $GEO_TOP ]]; then
+    CG_REGION="$GEO_TOP"
+    CG_REGION_SRC="geoip"
+  fi
+
+  http_probe "https://api.openai.com/v1/models"
+  CG_LIVE_CODE="$PROBE_CODE"
+  CG_LIVE=$(classify_openai_probe)
+
+  load_country_list "$SNAP_OPENAI_CODES" "$SNAP_OPENAI_PARTIAL" "$SNAP_OPENAI_DATE" \
+    "https://developers.openai.com/api/docs/supported-countries.md" \
+    "https://developers.openai.com/api/docs/supported-countries"
+  CG_LIST=$(list_state "$CG_REGION")
+  CG_VERDICT=$(make_verdict "$CG_LIVE" "$CG_LIST")
+}
+
 GEO_NAMES=("Cloudflare" "ipinfo.io" "ipwho.is" "ipapi.co" "ipaddress.com")
 GEO_FUNCS=(geo_cloudflare geo_ipinfo geo_ipwhois geo_ipapico geo_ipaddress)
 GEO_CODES=()
@@ -301,7 +1004,6 @@ cleanup() {
 # Запрашивает все источники параллельно и заполняет GEO_CODES
 run_geoip() {
   local i raw
-  TMPD=$(mktemp -d) || return 1
   for i in "${!GEO_FUNCS[@]}"; do
     if ((DEBUG)); then
       "${GEO_FUNCS[$i]}" >"$TMPD/$i" &
@@ -330,20 +1032,76 @@ tally_codes() {
   printf '%s\n' "${codes[@]}" | sort | uniq -c | sort -k1,1nr -k2,2 | awk '{print $2 " " $1}'
 }
 
+chatgpt_json() {
+  jq -n \
+    --arg region "$CG_REGION" --arg rsrc "$CG_REGION_SRC" \
+    --arg live "$CG_LIVE" --arg code "$CG_LIVE_CODE" \
+    --arg list "$CG_LIST" --arg lsrc "$LIST_SRC" --arg ldate "$LIST_DATE" \
+    --arg verdict "$CG_VERDICT" '
+    {name: "ChatGPT",
+     region: (if $region == "" then null else $region end),
+     region_source: (if $rsrc == "" then null else $rsrc end),
+     live: {state: $live, http: ($code | tonumber)},
+     list: {state: $list, source: $lsrc, snapshot_date: (if $ldate == "" then null else $ldate end)},
+     verdict: $verdict}'
+}
+
+# Цвет вердикта: зелёный, красный и маджента (читаются на тёмной и светлой теме)
+verdict_color() {
+  case "$1" in
+    ok) printf '%s' "$C_OK" ;;
+    blocked) printf '%s' "$C_BAD" ;;
+    *) printf '%s' "$C_WARN" ;;
+  esac
+}
+
+print_chatgpt() {
+  local lsrc color
+
+  printf '\n%s%s%s\n' "$C_BOLD" "$(t svc_chatgpt)" "$C_RST"
+
+  if [[ -n $CG_REGION ]]; then
+    printf '  %s: %s%s%s (%s)\n' "$(t l_region)" "$C_BOLD" "$CG_REGION" "$C_RST" "$(t "src_$CG_REGION_SRC")"
+  else
+    printf '  %s: %s%s%s\n' "$(t l_region)" "$C_WARN" "$(t region_none)" "$C_RST"
+  fi
+
+  printf '  %s: ' "$(t l_live)"
+  msg "live_$CG_LIVE" "$CG_LIVE_CODE"
+  printf '\n'
+
+  if [[ $LIST_SRC == web ]]; then
+    lsrc=$(t list_web)
+  else
+    lsrc=$(msg list_snapshot "$LIST_DATE")
+  fi
+  printf '  %s: %s (%s)\n' "$(t l_list_openai)" "$(t "list_$CG_LIST")" "$lsrc"
+
+  color=$(verdict_color "$CG_VERDICT")
+  printf '  %s: %s%s%s%s\n' "$(t l_verdict)" "$color" "$C_BOLD" "$(t "v_$CG_VERDICT")" "$C_RST"
+  if [[ $CG_VERDICT == conflict ]]; then
+    printf '  %s%s%s\n' "$C_WARN" "$(t note_conflict)" "$C_RST"
+  elif [[ $CG_VERDICT == partial ]]; then
+    printf '  %s%s%s\n' "$C_WARN" "$(t note_partial)" "$C_RST"
+  fi
+}
+
 print_json() {
   local top="$1" i rows=""
   for i in "${!GEO_NAMES[@]}"; do
     rows+="${GEO_NAMES[$i]}"$'\t'"${GEO_CODES[$i]}"$'\n'
   done
   printf '%s' "$rows" | jq -R -s \
-    --arg ver "$VERSION" --arg ip "$MY_IP" --arg top "$top" '
+    --arg ver "$VERSION" --arg ip "$MY_IP" --arg top "$top" \
+    --argjson services "[$(chatgpt_json)]" '
     split("\n")
     | map(select(length > 0) | split("\t") | {source: .[0], country: (if (.[1] // "") == "" then null else .[1] end)})
     as $rows
     | {version: $ver,
        ip: (if $ip == "" then null else $ip end),
        geoip: $rows,
-       consensus: (if $top == "" then null else $top end)}'
+       consensus: (if $top == "" then null else $top end),
+       services: $services}'
 }
 
 print_text() {
@@ -381,6 +1139,8 @@ print_text() {
     msg disagree "$parts"
     printf '%s\n' "$C_RST"
   fi
+
+  print_chatgpt
 }
 
 main() {
@@ -401,6 +1161,8 @@ main() {
   setup_colors
   check_deps
   trap cleanup EXIT
+  TMPD=$(mktemp -d) || exit 1
+  build_curl_args
 
   MY_IP=$(detect_ip)
   run_geoip
@@ -418,6 +1180,9 @@ main() {
   if [[ -n $top && ${second:-0} -eq $votes ]]; then
     top=""
   fi
+  GEO_TOP="$top"
+
+  check_chatgpt
 
   if ((JSON)); then
     print_json "$top"
